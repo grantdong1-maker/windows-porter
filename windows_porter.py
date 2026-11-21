@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-PCBS2 Porter — translate Windows games to run natively on Ubuntu/Linux.
+Windows Porter — translate Windows games to run natively on Ubuntu/Linux.
 
 No emulation: Wine translates Win32 API calls to native Linux calls, and
 DXVK translates Direct3D 9/10/11 to Vulkan. Every call happens at full
-native speed on your CPU/GPU.
+native speed on your CPU/GPU. Optional Turbo mode launches through Proton
+(Valve's optimized Wine build via umu-launcher).
 
 Supported GPUs: Intel (Iris Xe etc.), AMD, NVIDIA.
 Supported distros: Ubuntu/Debian, Fedora, Arch/Manjaro/SteamOS-like, openSUSE.
@@ -18,12 +19,21 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, scrolledtext, ttk
 from urllib.request import urlopen
 
-APP_TITLE = "PCBS2 Porter"
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, scrolledtext, ttk
+except ImportError:
+    print("=" * 60, file=sys.stderr)
+    print("Windows Porter needs Python's tkinter (GUI toolkit).", file=sys.stderr)
+    print("Install it by running this in a terminal:", file=sys.stderr)
+    print("    sudo apt install python3-tk", file=sys.stderr)
+    print("=" * 60, file=sys.stderr)
+    sys.exit(1)
+
+APP_TITLE = "Windows Porter"
 PREFIX_DIR = Path.home() / "Games" / "pcbs2-prefix"
 PROTON_PREFIX_DIR = Path.home() / "Games" / "proton-prefix"
 DXVK_DIR = Path.home() / "Games" / "dxvk"
@@ -41,24 +51,24 @@ DXVK_DLLS = ["d3d9.dll", "d3d10core.dll", "d3d11.dll", "dxgi.dll"]
 
 DISTRO_PKGS = {
     "debian": {
-        "Intel/AMD": "mesa-vulkan-drivers mesa-utils libvulkan1 wine wine64 winetricks",
-        "NVIDIA": "libnvidia-gl-1 wine wine64 winetricks",
-        "base": "wine wine64 winetricks libvulkan1",
+        "Intel/AMD": "mesa-vulkan-drivers mesa-utils libvulkan1 wine wine64 winetricks python3-tk",
+        "NVIDIA": "libnvidia-gl-580 wine wine64 winetricks python3-tk",
+        "base": "wine wine64 winetricks libvulkan1 mesa-vulkan-drivers mesa-utils python3-tk",
     },
     "fedora": {
-        "Intel/AMD": "mesa-vulkan-drivers vulkan-loader wine winetricks",
-        "NVIDIA": "xorg-x11-drv-nvidia vulkan-loader wine winetricks",
-        "base": "wine winetricks vulkan-loader",
+        "Intel/AMD": "mesa-vulkan-drivers vulkan-loader wine winetricks python3-tkinter",
+        "NVIDIA": "xorg-x11-drv-nvidia vulkan-loader wine winetricks python3-tkinter",
+        "base": "wine winetricks vulkan-loader python3-tkinter",
     },
     "arch": {
-        "Intel/AMD": "vulkan-intel vulkan-radeon vulkan-tools wine winetricks",
-        "NVIDIA": "nvidia-utils wine winetricks",
-        "base": "wine winetricks vulkan-icd-loader",
+        "Intel/AMD": "vulkan-intel vulkan-radeon vulkan-tools wine winetricks tk",
+        "NVIDIA": "nvidia-utils wine winetricks tk",
+        "base": "wine winetricks vulkan-icd-loader tk",
     },
     "suse": {
-        "Intel/AMD": "Mesa-vulkan-drivers vulkan-loader wine winetricks",
-        "NVIDIA": "x11-video-nvidiaG06 vulkan-loader wine winetricks",
-        "base": "wine winetricks vulkan-loader",
+        "Intel/AMD": "Mesa-vulkan-drivers vulkan-loader wine winetricks python3-tk",
+        "NVIDIA": "x11-video-nvidiaG06 vulkan-loader wine winetricks python3-tk",
+        "base": "wine winetricks vulkan-loader python3-tk",
     },
 }
 
@@ -159,10 +169,7 @@ class Porter:
         base = INSTALL_CMDS[distro]
 
         if distro == "debian":
-            script = f"sudo apt update && sudo apt install -y {packages} \\\n  mesa-vulkan-drivers libvulkan1"
-            # NVIDIA users on apt keep their driver package out to avoid conflicts
-            if gpu_vendor == "NVIDIA":
-                script = f"sudo apt update && sudo apt install -y wine wine64 winetricks libvulkan1"
+            script = f"sudo apt update && sudo apt install -y {packages}"
         else:
             script = " ".join(base[:-1] + [f"{base[-1]} {packages}"]).replace("  ", " ")
             if distro == "fedora":
@@ -341,6 +348,74 @@ class Porter:
                              stdout=logf, stderr=subprocess.STDOUT)
         self.log(f"Game started via Proton. Output logged to {WINE_LOG}")
 
+    def install_umu(self):
+        """Download umu-launcher for this distro and hand it to a terminal
+        for sudo install. Afterwards Turbo mode (Proton) is available."""
+        data = {}
+        try:
+            for line in Path("/etc/os-release").read_text().splitlines():
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    data[k] = v.strip('"')
+        except OSError:
+            pass
+        id_like = (data.get("ID", "") + " " + data.get("ID_LIKE", "")).lower()
+        codename = data.get("VERSION_CODENAME", "")
+        arch = platform.machine()
+        suffix = None
+        if "ubuntu" in id_like:
+            suffix = f"ubuntu-{codename}" if codename in ("noble", "resolute") else "ubuntu-noble"
+        elif "debian" in id_like:
+            major = data.get("VERSION_ID", "").split(".")[0]
+            try:
+                dver = Path("/etc/debian_version").read_text().split(".")[0].strip()
+                major = dver or major
+            except OSError:
+                pass
+            suffix = f"debian-{major if major in ('12', '13') else '13'}"
+        if suffix is None:
+            self.log("Can't auto-pick an umu package for this distro — download one manually from:")
+            self.log("https://github.com/Open-Wine-Components/umu-launcher/releases")
+            return
+
+        self.log("Fetching latest umu-launcher release...")
+        with urlopen("https://api.github.com/repos/Open-Wine-Components/umu-launcher/releases/latest",
+                     timeout=30) as resp:
+            rel = json.load(resp)
+        asset_url = None
+        asset_name = None
+        for a in rel["assets"]:
+            n = a["name"]
+            if arch == "x86_64" and "amd64" not in n:
+                continue
+            if arch == "aarch64" and "arm64" not in n:
+                continue
+            if suffix in n and n.endswith(".deb"):
+                asset_url, asset_name = a["browser_download_url"], n
+                break
+        if asset_url is None:
+            self.log(f"No matching .deb found for {suffix}. Pick one manually from the releases page.")
+            return
+
+        dl_path = Path.home() / "Downloads" / asset_name
+        self.log(f"Downloading {asset_name} ...")
+        with urlopen(asset_url, timeout=300) as resp, open(dl_path, "wb") as out:
+            shutil.copyfileobj(resp, out)
+        self.log(f"Saved to {dl_path}")
+        script = f"sudo apt install -y {dl_path}; echo Press Enter; read"
+        t = term_cmd()
+        if t is None:
+            self.log("No terminal emulator found — run the command above manually.")
+            return
+        if Path(t).name in ("gnome-terminal", "kgx"):
+            subprocess.Popen([t, "--", "bash", "-c", script])
+        elif Path(t).name == "kitty":
+            subprocess.Popen([t, "bash", "-c", script])
+        else:
+            subprocess.Popen([t, "-e", "bash", "-c", script])
+        self.log("Opened a terminal to finish installing umu (enter your password).")
+        self.log("After it installs, restart Windows Porter — ⚡ Turbo mode will switch on.")
+
     def fix_startup(self):
         """Apply the two most common crash fixes for Unity/DXVK games."""
         env = dict(os.environ, WINEPREFIX=str(PREFIX_DIR), WINEARCH="win64")
@@ -367,7 +442,7 @@ class App(tk.Tk):
         self.porter = Porter(self.log)
 
         pad = dict(padx=10, pady=6)
-        header = ttk.Label(self, text="PCBS2 Porter — translate Windows games to Linux (no emulation)",
+        header = ttk.Label(self, text="Windows Porter — translate Windows games to Linux (no emulation)",
                            font=("Sans", 13, "bold"))
         header.pack(**pad, anchor="w")
 
@@ -415,6 +490,7 @@ class App(tk.Tk):
         ttk.Button(actions, text="3. Install DXVK", command=self.dxvk).pack(side="left", padx=2)
         ttk.Button(actions, text="4. ▶ Run game", command=self.play).pack(side="left", padx=2)
         ttk.Button(actions, text="▶ Run .bat", command=self.run_batch).pack(side="left", padx=2)
+        ttk.Button(actions, text="Install umu (Turbo)", command=self.install_umu).pack(side="left", padx=2)
         ttk.Button(actions, text="5. Fix startup", command=self.fix_startup).pack(side="left", padx=2)
         ttk.Button(actions, text="View game log", command=self.view_log).pack(side="left", padx=2)
 
@@ -452,9 +528,8 @@ class App(tk.Tk):
 
     def turbo_changed(self):
         if self.turbo_var.get() and not have("umu-run"):
-            self.log("umu-launcher not installed. Install it with:")
-            self.log(f"  sudo apt install ~/Downloads/python3-umu-launcher_1.4.4-1_amd64_ubuntu-resolute.deb")
-            self.log("umu-run then auto-downloads the latest GE-Proton (optimized Wine) on first launch.")
+            self.log("umu-launcher not installed — click 'Install umu (Turbo)' first.")
+            self.log("Once installed, restart the app and ⚡ Turbo mode switches on automatically.")
         elif self.turbo_var.get():
             self.log("⚡ Turbo mode ON — games will launch via Proton into ~/Games/proton-prefix.")
         else:
@@ -544,6 +619,9 @@ class App(tk.Tk):
             messagebox.showwarning(APP_TITLE, "Wine is not installed yet — run step 1 first.")
             return
         self.porter.fix_startup()
+
+    def install_umu(self):
+        self.porter.install_umu()
 
     def view_log(self):
         if not WINE_LOG.exists():

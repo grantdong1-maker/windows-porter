@@ -1,4 +1,4 @@
 #!/usr/bin/env bash
-# Launch PCBS2 Porter
+# Launch Windows Porter
 cd "$(dirname "$0")"
-python3 pcbs2_porter.py
+python3 windows_porter.py
